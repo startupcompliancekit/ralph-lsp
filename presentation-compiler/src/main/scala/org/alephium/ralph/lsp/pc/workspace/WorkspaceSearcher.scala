@@ -262,10 +262,16 @@ object WorkspaceSearcher {
       types: Seq[Type],
       workspace: WorkspaceState.IsSourceAware): ArraySeq[(Ast.TypeId, SourceLocation.CodeStrict)] = {
     val workspaceTrees = collectAllTrees(workspace)
-    SourceCodeSearcher.collectTypes(
-      types = types,
-      workspaceSource = workspaceTrees
-    )
+    val builtIn        = workspace.build.findDependency(DependencyID.BuiltIn)
+    workspaceTrees.flatMap {
+      code =>
+        val primitiveSource = builtIn.exists(code.parsed.isPrimitive)
+        val matchingTypes = types.filter {
+          case Type.Bool | Type.U256 | Type.I256 | Type.Address | Type.ByteVec => primitiveSource
+          case _                                                               => !primitiveSource
+        }
+        SourceCodeSearcher.collectTypes(matchingTypes, code)
+    }
   }
 
   /**
@@ -413,35 +419,27 @@ object WorkspaceSearcher {
       workspace: WorkspaceState.IsSourceAware,
       includeNonImportedCode: Boolean
     )(implicit logger: ClientLogger): ArraySeq[SourceLocation.CodeSoft] = {
-    val (stdSourceParsedCode, primitives) =
-      collectDependencySourceCode(workspace.build)
+    val workspaceCode = SourceCodeSearcher.collectIsParsed(workspace.sourceCode)
+    val imports       = SourceCodeSearcher.collectImportStatementsSoft(workspaceCode).flatMap(_.string).map(_.toCode()).toSet
+    SourceCodeSearcher.collectSourceTreesSoft(workspaceCode) ++
+      collectImportedTreesSoft(workspace.build, imports, includeNonImportedCode)
+  }
 
-    // collect all parsed source-files
-    val workspaceCode =
-      SourceCodeSearcher.collectIsParsed(workspace.sourceCode)
-
+  /** Dependency-only scope, reusable while a build and its local imports are unchanged. */
+  private[pc] def collectImportedTreesSoft(
+      build: BuildState.Compiled,
+      imports: Set[String],
+      includeNonImportedCode: Boolean = false
+    )(implicit logger: ClientLogger): ArraySeq[SourceLocation.CodeSoft] = {
+    val (stdSourceParsedCode, primitives) = collectDependencySourceCode(build)
     val importedCode =
-      if (includeNonImportedCode) {
-        stdSourceParsedCode
-      } else {
-        // collect all import statements
-        val importStatements =
-          SourceCodeSearcher
-            .collectImportStatementsSoft(workspaceCode)
-            .flatMap(_.string)
-            .map(_.toCode())
-
-        // filter out std files that are not imported
-        stdSourceParsedCode filter {
-          stdCode =>
-            stdCode
-              .importIdentifier
-              .exists {
-                stdImportIdentifier =>
-                  importStatements contains stdImportIdentifier.string.value
-              }
-        }
-      }
+      if (includeNonImportedCode) stdSourceParsedCode
+      else
+        stdSourceParsedCode.filter(
+          _.importIdentifier.exists(
+            id => imports.contains(id.string.value)
+          )
+        )
 
     // Pull in all inherited source-files for the used import statements.
     val importedInheritedParentTrees =
@@ -454,14 +452,10 @@ object WorkspaceSearcher {
     val allImportedCode =
       (SourceCodeSearcher.collectSourceTreesSoft(importedCode) ++ importedInheritedParentTrees).distinct
 
-    // The entire local dev workspace source-code is available.
-    val workspaceTrees =
-      SourceCodeSearcher.collectSourceTreesSoft(workspaceCode)
-
     val primitiveTrees =
       SourceCodeSearcher.collectSourceTreesSoft(primitives)
 
-    workspaceTrees ++ allImportedCode ++ primitiveTrees
+    allImportedCode ++ primitiveTrees
   }
 
   /**

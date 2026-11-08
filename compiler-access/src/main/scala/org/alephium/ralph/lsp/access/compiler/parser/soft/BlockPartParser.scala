@@ -11,19 +11,22 @@ private object BlockPartParser {
   def parseOrFail[Unknown: P](
       blockExpressions: Boolean,
       stop: Token*): P[SoftAST.BlockPartAST] =
-    P {
-      SpaceParser.parseOrFail |
-        TemplateParser.parseOrFail |
-        EventParser.parseOrFail |
-        StructParser.parseOrFail |
-        ConstParser.parseOrFail |
-        FunctionParser.parseOrFail |
-        EnumParser.parseOrFail |
-        ImportParser.parseOrFail |
-        InheritanceParser.parseOrFail |
-        expression(blockExpressions) |
-        CommentParser.parseOrFail |
-        UnresolvedParser.parseOrFailSpaceDelimited(stop: _*)
+    IncrementalSoftParser.reuseOrElse {
+      P {
+        SpaceParser.parseOrFail |
+          TestDeclarationParser.parseOrFail |
+          TemplateParser.parseOrFail |
+          EventParser.parseOrFail |
+          StructParser.parseOrFail |
+          ConstParser.parseOrFail |
+          FunctionParser.parseOrFail |
+          EnumParser.parseOrFail |
+          ImportParser.parseOrFail |
+          InheritanceParser.parseOrFail |
+          expression(blockExpressions) |
+          CommentParser.parseOrFail |
+          UnresolvedParser.parseOrFailSpaceDelimited(stop: _*)
+      }
     }
 
   private def expression[Unknown: P](blockExpressions: Boolean): P[SoftAST.BlockPartAST] =

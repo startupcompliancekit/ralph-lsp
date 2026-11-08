@@ -7,7 +7,8 @@ import org.alephium.ralph.lsp.access.compiler.message.SourceIndexExtra._
 import org.alephium.ralph.lsp.access.compiler.parser.soft.ast.{SoftAST, Token}
 import org.alephium.ralph.lsp.pc.sourcecode.{SourceCodeSearcher, SourceLocation}
 import org.alephium.ralph.lsp.pc.workspace.WorkspaceState
-import org.alephium.ralph.lsp.utils.Node
+import org.alephium.ralph.lsp.utils.{Node, URIUtil}
+import org.alephium.ralph.lsp.pc.workspace.build.dependency.Dependency
 import org.alephium.ralph.lsp.utils.log.{ClientLogger, StrictImplicitLogging}
 import org.alephium.ralph.SourceIndex
 import org.alephium.ralph.lsp.pc.search.CodeProvider
@@ -33,14 +34,70 @@ private object GoToDefIdentifier extends StrictImplicitLogging {
       workspace: WorkspaceState.IsSourceAware,
       settings: GoToDefSetting
     )(implicit searchCache: SearchCache,
-      logger: ClientLogger): Iterator[SourceLocation.NodeSoft[SoftAST.CodeString]] =
-    searchParent(
-      identNode = identNode,
-      parent = identNode.parent,
-      sourceCode = sourceCode,
-      cache = searchCache.get(workspace),
-      settings = settings
-    )
+      logger: ClientLogger): Iterator[SourceLocation.NodeSoft[SoftAST.CodeString]] = {
+    val definitions =
+      identNode.walkParents.collectFirst {
+        case Node(annotation: SoftAST.Annotation, _) if annotation.identifier contains identNode.data =>
+          (annotation, Option.empty[SoftAST.Identifier])
+        case Node(annotation: SoftAST.Annotation, _)
+            if annotation
+              .tuple
+              .exists(_.expressions.exists {
+                case assignment: SoftAST.Assignment => assignment.expressionLeft contains identNode.data
+                case _                              => false
+              }) =>
+          (annotation, Some(identNode.data))
+      } match {
+        case Some((annotation, field)) =>
+          GoToDefAnnotation(annotation, field, workspace)
+        case None =>
+          val cache = searchCache.get(workspace)
+          def searchNode(node: Node[SoftAST.Identifier, SoftAST]) =
+            searchParent(node, node.parent, sourceCode, cache, settings)
+          // Prefer an available callable for ambiguous incomplete approvals;
+          // explicit field syntax still follows the ordinary struct path.
+          val call = incompleteApprovalCall(identNode).iterator.flatMap(searchNode).buffered
+          if (call.hasNext) call else searchNode(identNode)
+      }
+    settings.goToRefSetting match {
+      case None => definitions
+      case Some(referenceSettings) =>
+        val resolved = definitions.toVector
+        (resolved.iterator ++ GoToDefReference.search(identNode, sourceCode, searchCache.get(workspace), referenceSettings, resolved)).distinct
+    }
+  }
+
+  private def incompleteApprovalCall(target: Node[SoftAST.Identifier, SoftAST]): Option[Node[SoftAST.Identifier, SoftAST]] =
+    target.parent match {
+      case Some(Node(constructor: SoftAST.StructConstructor, _))
+          if constructor.identifier == target.data && target.data.code.text.headOption.exists(_.isLower) && !target.isWithinEmit() &&
+            constructor.params.expressions.nonEmpty && constructor.params.expressions.forall {
+              case field: SoftAST.StructConstructorField => field.colon.isInstanceOf[SoftAST.TokenExpected[_]]
+              case _: SoftAST.Unresolved                 => true
+              case _                                     => false
+            } =>
+        val index = target.data.index
+        val call = SoftAST.ReferenceCall(
+          index = index,
+          reference = target.data.deepCopy(index),
+          preAssetApprovalSpace = None,
+          assetApproval = None,
+          preArgumentsSpace = None,
+          arguments = SoftAST.Group[Token.OpenParen.type, Token.CloseParen.type, Token.Comma.type](
+            index = index,
+            openToken = None,
+            preHeadExpressionSpace = None,
+            headExpression = None,
+            preTailExpressionSpace = None,
+            tailExpressions = Seq.empty,
+            closeToken = None
+          )
+        )
+        call.toNode.walk.collectFirst {
+          case node @ Node(identifier: SoftAST.Identifier, _) => node.upcast(identifier)
+        }
+      case _ => None
+    }
 
   /**
    * Searches definitions given the location of the identifier node [[SoftAST.Identifier]]
@@ -84,7 +141,7 @@ private object GoToDefIdentifier extends StrictImplicitLogging {
 
     parent match {
       case Some(Node(annotation: SoftAST.Annotation, _)) if annotation.identifier contains identNode.data =>
-        // TODO: Support jump-definition for annotations: https://github.com/alephium/ralph-lsp/issues/589
+        // Do not let unmatched annotation syntax fall back to ordinary local definitions.
         Iterator.empty
 
       case Some(Node(assignment: SoftAST.TypeAssignment, _)) if assignment.expressionLeft == identNode.data =>
@@ -153,7 +210,7 @@ private object GoToDefIdentifier extends StrictImplicitLogging {
           case Some(grandParentNode @ Node(_: SoftAST.Group[_, _, _], _)) =>
             grandParentNode.parent match {
               case Some(Node(_: SoftAST.Annotation, _)) =>
-                // TODO: Support jump-definition for annotations: https://github.com/alephium/ralph-lsp/issues/589
+                // Do not let unmatched annotation syntax fall back to ordinary local definitions.
                 Iterator.empty
 
               case _ =>
@@ -748,25 +805,47 @@ private object GoToDefIdentifier extends StrictImplicitLogging {
     // Inheritance search must include all built-in interfaces.
     val builtInTrees =
       sourceCode.part match {
-        case _: SoftAST.Enum | _: SoftAST.Event | _: SoftAST.Struct =>
-          // Disable for enum, structs, events
-          ArraySeq.empty
-
+        case _: SoftAST.Template | _: SoftAST.TestDeclaration =>
+          // Tests now have their own syntax tree; unrelated root expressions are not test scopes.
+          cache.builtInTrees.filter {
+            tree =>
+              // Native events are not candidates for the relaxed function/variable fallback.
+              URIUtil.getFileName(tree.parsed.fileURI) != Dependency.EVENT_FILE_NAME || target.isWithinEmit()
+          }
         case _ =>
-          // Allow built-in searches for everything else
-          cache.builtInTrees
+          ArraySeq.empty
       }
 
-    // Merge both the actual inherited trees and the built-in trees.
+    // Persisted native event metadata uses valid struct declarations, but is
+    // eligible only for emit targets, never ordinary function/variable lookup.
+    val (nativeEvents, ordinaryBuiltIns) =
+      builtInTrees.partition(
+        tree => URIUtil.getFileName(tree.parsed.fileURI) == Dependency.EVENT_FILE_NAME
+      )
+    val eventMatches = nativeEvents.iterator.flatMap {
+      source =>
+        source
+          .part
+          .toNode
+          .walk
+          .collect {
+            case Node(metadata: SoftAST.Struct, _) => metadata.identifier
+          }
+          .flatMap(
+            name => searchIdentifier(name, target, source)
+          )
+    }
+
+    // Merge both the actual inherited trees and the ordinary built-in trees.
     val allInheritedTrees =
-      inheritedTrees.iterator ++ builtInTrees
+      inheritedTrees.iterator ++ ordinaryBuiltIns
 
     // Execute inheritance search.
     searchInheritance(
       target = target,
       inheritance = allInheritedTrees,
       detectCallSyntax = detectCallSyntax
-    )
+    ) ++ eventMatches
   }
 
   /**
@@ -1645,7 +1724,7 @@ private object GoToDefIdentifier extends StrictImplicitLogging {
       CodeProvider
         .goToTypeDef
         .search(
-          linePosition = theType.index.toLineRange(sourceCode.parsed.code).from,
+          ast = theType,
           fileURI = sourceCode.parsed.fileURI,
           workspace = cache.workspace,
           searchSettings = ()
